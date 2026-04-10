@@ -27,8 +27,8 @@ BOOK_COLUMN_MAP = {
 }
 
 INSERT_BOOK_SQL = """
-    INSERT IGNORE INTO books (title, author, publisher, purchaseDate)
-    VALUES (%(title)s, %(author)s, %(publisher)s, %(purchaseDate)s)
+    INSERT IGNORE INTO books (title, author, publisher, purchaseDate, updatedAt)
+    VALUES (%(title)s, %(author)s, %(publisher)s, %(purchaseDate)s, %(purchaseDate)s)
 """
 
 # ── 독서 기록 설정 ────────────────────────────────────────────────
@@ -87,7 +87,7 @@ def read_book_sheet(file_path: str, sheet_name: str) -> pd.DataFrame:
 
     df = df[list(BOOK_COLUMN_MAP.keys())].rename(columns=BOOK_COLUMN_MAP)
     df = df.dropna(how="all")
-    df["purchaseDate"] = df["purchaseDate"].fillna("1999-01-01")
+    df["purchaseDate"] = df["purchaseDate"].str.replace(r"\s+", "", regex=True).fillna("1999-01-01")
     df = df.where(pd.notna(df), None)
     return df
 
