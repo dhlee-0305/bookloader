@@ -24,11 +24,17 @@ BOOK_COLUMN_MAP = {
     "작가": "author",
     "출판사": "publisher",
     "구입 날짜": "purchaseDate",
+    "상태": "status",
+}
+
+BOOK_STATUS_MAP = {
+    "기부": "DONATED",
+    "판매": "SOLD",
 }
 
 INSERT_BOOK_SQL = """
-    INSERT IGNORE INTO books (title, author, publisher, purchaseDate, updatedAt)
-    VALUES (%(title)s, %(author)s, %(publisher)s, %(purchaseDate)s, %(purchaseDate)s)
+    INSERT IGNORE INTO books (title, author, publisher, purchaseDate, updatedAt, status)
+    VALUES (%(title)s, %(author)s, %(publisher)s, %(purchaseDate)s, %(purchaseDate)s, %(status)s)
 """
 
 # ── 독서 기록 설정 ────────────────────────────────────────────────
@@ -87,7 +93,13 @@ def read_book_sheet(file_path: str, sheet_name: str) -> pd.DataFrame:
 
     df = df[list(BOOK_COLUMN_MAP.keys())].rename(columns=BOOK_COLUMN_MAP)
     df = df.dropna(how="all")
-    df["purchaseDate"] = df["purchaseDate"].str.replace(r"\s+", "", regex=True).fillna("1999-01-01")
+    df["purchaseDate"] = (
+        df["purchaseDate"]
+        .str.replace(r"\s+", "", regex=True)
+        .str.replace(r"00$", "01", regex=True)
+        .fillna("1999-01-01")
+    )
+    df["status"] = df["status"].map(BOOK_STATUS_MAP).fillna("OWNED")
     df = df.where(pd.notna(df), None)
     return df
 
