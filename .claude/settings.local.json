@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls c:/Downloads/workspace_python/bookloader/*.py)",
+      "Bash(python -c ':*)"
+    ]
+  }
+}

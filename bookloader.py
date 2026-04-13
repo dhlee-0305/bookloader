@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pandas as pd
 import pymysql
+from openpyxl import load_workbook
+
+from kakao import search_book
 
 # 로깅 설정
 logging.basicConfig(
@@ -33,8 +36,8 @@ BOOK_STATUS_MAP = {
 }
 
 INSERT_BOOK_SQL = """
-    INSERT IGNORE INTO books (title, author, publisher, purchaseDate, updatedAt, status)
-    VALUES (%(title)s, %(author)s, %(publisher)s, %(purchaseDate)s, %(purchaseDate)s, %(status)s)
+    INSERT IGNORE INTO books (title, author, publisher, purchaseDate, updatedAt, status, isbn, coverUrl)
+    VALUES (%(title)s, %(author)s, %(publisher)s, %(purchaseDate)s, %(purchaseDate)s, %(status)s, %(isbn)s, %(coverUrl)s)
 """
 
 # ── 독서 기록 설정 ────────────────────────────────────────────────
@@ -85,14 +88,19 @@ def get_db_connection(config: configparser.ConfigParser) -> pymysql.connections.
 # ── 도서 목록 처리 ────────────────────────────────────────────────
 def read_book_sheet(file_path: str, sheet_name: str) -> pd.DataFrame:
     """도서 목록 시트 읽기 (헤더: 2행)"""
-    df = pd.read_excel(file_path, sheet_name=sheet_name, header=1, dtype=str)
+    df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=1, dtype=str)
 
-    missing = [col for col in BOOK_COLUMN_MAP if col not in df.columns]
+    missing = [col for col in BOOK_COLUMN_MAP if col not in df_raw.columns]
     if missing:
         raise ValueError(f"[{sheet_name}] 시트에 필수 컬럼이 없습니다: {missing}")
 
-    df = df[list(BOOK_COLUMN_MAP.keys())].rename(columns=BOOK_COLUMN_MAP)
-    df = df.dropna(how="all")
+    df = df_raw[list(BOOK_COLUMN_MAP.keys())].rename(columns=BOOK_COLUMN_MAP)
+
+    # isbn, coverUrl 컬럼 추가 (없거나 NaN이면 빈 문자열로 초기화)
+    for col in ("isbn", "coverUrl"):
+        df[col] = df_raw[col].fillna("").astype(str) if col in df_raw.columns else ""
+
+    df = df.dropna(subset=list(BOOK_COLUMN_MAP.values()), how="all")
     df["purchaseDate"] = (
         df["purchaseDate"]
         .str.replace(r"\s+", "", regex=True)
@@ -104,10 +112,120 @@ def read_book_sheet(file_path: str, sheet_name: str) -> pd.DataFrame:
     return df
 
 
+def enrich_books_with_kakao(df: pd.DataFrame, config: configparser.ConfigParser) -> pd.DataFrame:
+    """isbn 또는 coverUrl이 없는 도서를 카카오 도서 검색 API로 보완합니다.
+
+    - 첫 번째 검색 결과의 isbn / thumbnail을 사용합니다.
+    - 검색 결과가 없으면 빈 문자열('')을 저장합니다.
+    """
+    needs_enrich_mask = (
+        df["isbn"].isna() | (df["isbn"] == "") |
+        df["coverUrl"].isna() | (df["coverUrl"] == "")
+    )
+    target_indices = df.index[needs_enrich_mask].tolist()
+
+    if not target_indices:
+        logger.info("카카오 API 보완 대상 없음")
+        return df
+
+    logger.info("카카오 API로 도서 정보 보완 대상: %d건", len(target_indices))
+
+    for idx in target_indices:
+        row = df.loc[idx]
+        isbn_val = row.get("isbn")
+        cover_val = row.get("coverUrl")
+
+        # 둘 중 값이 하나라도 없으면 API 호출 대상. 둘 다 존재하면 건너뜀
+        if (len(isbn_val) > 5) and (len(cover_val) > 5):
+            logger.info("이미 isbn과 coverUrl이 존재하여 건너뜀 - title: '%s', isbn: '%s', coverUrl: '%s'", row.get("title"), isbn_val, cover_val)
+            continue
+
+        title     = str(row.get("title") or "").strip()
+        author    = str(row.get("author") or "").strip()
+        publisher = str(row.get("publisher") or "").strip()
+
+        if not any([title, author, publisher]):
+            logger.warning("검색어를 구성할 수 없어 건너뜀 (idx=%s)", idx)
+            continue
+
+        logger.info(
+            "카카오 API 호출 - title: '%s' | author: '%s' | publisher: '%s'",
+            title, author, publisher,
+        )
+        try:
+            books = search_book(config, title=title, author=author, publisher=publisher)
+            if books:
+                first = books[0]
+                new_isbn  = first.get("isbn", "") or ""
+                new_cover = first.get("thumbnail", "") or ""
+                if not isbn_val:
+                    df.loc[idx, "isbn"] = new_isbn
+                if not cover_val:
+                    df.loc[idx, "coverUrl"] = new_cover
+                logger.info(
+                    "카카오 검색 성공 - title: '%s' | isbn: '%s' | coverUrl: '%s'",
+                    title, new_isbn, new_cover,
+                )
+            else:
+                if not isbn_val:
+                    df.loc[idx, "isbn"] = ""
+                if not cover_val:
+                    df.loc[idx, "coverUrl"] = ""
+                logger.warning(
+                    "카카오 검색 결과 없음 - title: '%s' | author: '%s' | publisher: '%s'",
+                    title, author, publisher,
+                )
+        except Exception as e:
+            logger.error(
+                "카카오 검색 오류 - title: '%s' | author: '%s' | publisher: '%s' | error: %s",
+                title, author, publisher, e,
+            )
+            if not isbn_val:
+                df.loc[idx, "isbn"] = ""
+            if not cover_val:
+                df.loc[idx, "coverUrl"] = ""
+
+    return df
+
+
+def update_excel_book_details(file_path: str, sheet_name: str, df: pd.DataFrame) -> None:
+    """isbn과 coverUrl을 원본 엑셀 파일에 업데이트합니다.
+
+    header=1 로 읽은 DataFrame의 index i 는 엑셀 1-based 행 번호 i+3 에 해당합니다.
+    (row 1 = 빈 행, row 2 = 헤더, row 3 = 데이터 첫 행)
+    """
+    wb = load_workbook(file_path)
+    ws = wb[sheet_name]
+
+    # 헤더 행(2행, 1-based)에서 isbn, coverUrl 컬럼 번호 탐색
+    header_row_num = 2
+    col_indices: dict[str, int] = {}
+    for cell in ws[header_row_num]:
+        if cell.value in ("isbn", "coverUrl"):
+            col_indices[cell.value] = cell.column
+
+    if not col_indices:
+        logger.warning("[%s] 엑셀에서 isbn/coverUrl 컬럼을 찾을 수 없어 업데이트를 건너뜁니다.", sheet_name)
+        wb.close()
+        return
+
+    updated = 0
+    for i, row in df.iterrows():
+        excel_row = i + 3  # pandas index → 엑셀 1-based 행
+        for col_name, col_idx in col_indices.items():
+            value = row.get(col_name)
+            ws.cell(row=excel_row, column=col_idx, value=value if value is not None else "")
+            updated += 1
+
+    wb.save(file_path)
+    logger.info("[%s] 엑셀 isbn/coverUrl 업데이트 완료 (%d 셀)", sheet_name, updated)
+
+
 def insert_books(cursor, df: pd.DataFrame) -> tuple[int, int]:
     inserted, skipped = 0, 0
     for _, row in df.iterrows():
-        record = row.to_dict()
+        # pandas NaN(float)은 MySQL에 전달 불가 → None으로 변환
+        record = {k: None if isinstance(v, float) and pd.isna(v) else v for k, v in row.to_dict().items()}
         cursor.execute(INSERT_BOOK_SQL, record)
         if cursor.rowcount == 1:
             inserted += 1
@@ -117,12 +235,19 @@ def insert_books(cursor, df: pd.DataFrame) -> tuple[int, int]:
     return inserted, skipped
 
 
-def process_book_sheets(cursor, excel_path: str, sheet_names: list[str]):
+def process_book_sheets(cursor, excel_path: str, sheet_names: list[str], config: configparser.ConfigParser):
     for sheet in sheet_names:
         logger.info("=== 도서 목록 시트 처리: [%s] ===", sheet)
         try:
             df = read_book_sheet(excel_path, sheet)
             logger.info("[%s] 읽은 행 수: %d", sheet, len(df))
+
+            # isbn/coverUrl 보완 (카카오 API)
+            df = enrich_books_with_kakao(df, config)
+
+            # 원본 엑셀 파일에 isbn/coverUrl 업데이트
+            update_excel_book_details(excel_path, sheet, df)
+
             inserted, skipped = insert_books(cursor, df)
             logger.info("[%s] 저장 완료 - 삽입: %d건, 중복 무시: %d건", sheet, inserted, skipped)
         except ValueError as e:
@@ -233,8 +358,8 @@ def main():
     conn = get_db_connection(config)
     try:
         with conn.cursor() as cursor:
-            # 1단계: 도서 목록 저장
-            process_book_sheets(cursor, excel_path, book_sheets)
+            # 1단계: 도서 목록 저장 (isbn/coverUrl 보완 포함)
+            process_book_sheets(cursor, excel_path, book_sheets, config)
             conn.commit()
             logger.info("도서 목록 저장 완료")
 
