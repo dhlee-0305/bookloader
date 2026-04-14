@@ -88,6 +88,7 @@ def print_book_info(book: dict, index: int) -> None:
         print(f"  소개     : {contents[:100]}{'...' if len(contents) > 100 else ''}")
 
     print(f"  상세URL  : {book.get('url', '-')}")
+    print(f"  썸네일   : {book.get('thumbnail', '-')}")
 
 
 def main():
