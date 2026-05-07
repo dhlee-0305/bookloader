@@ -35,9 +35,14 @@ BOOK_STATUS_MAP = {
     "판매": "SOLD",
 }
 
+BOOK_GENRE_MAP = {
+    "도서목록": "기타",
+    "IT서적": "기술/IT",
+}
+
 INSERT_BOOK_SQL = """
-    INSERT IGNORE INTO books (title, author, publisher, purchaseDate, updatedAt, status, isbn, coverUrl)
-    VALUES (%(title)s, %(author)s, %(publisher)s, %(purchaseDate)s, %(purchaseDate)s, %(status)s, %(isbn)s, %(coverUrl)s)
+    INSERT IGNORE INTO books (title, author, publisher, purchaseDate, updatedAt, status, isbn, coverUrl, genre)
+    VALUES (%(title)s, %(author)s, %(publisher)s, %(purchaseDate)s, %(purchaseDate)s, %(status)s, %(isbn)s, %(coverUrl)s, %(genre)s)
 """
 
 # ── 독서 기록 설정 ────────────────────────────────────────────────
@@ -108,6 +113,7 @@ def read_book_sheet(file_path: str, sheet_name: str) -> pd.DataFrame:
         .fillna("1999-01-01")
     )
     df["status"] = df["status"].map(BOOK_STATUS_MAP).fillna("OWNED")
+    df["genre"] = BOOK_GENRE_MAP.get(sheet_name, "기타")
     df = df.where(pd.notna(df), None)
     return df
 
